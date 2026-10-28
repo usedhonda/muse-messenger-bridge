@@ -35,14 +35,22 @@ ahead of its handed position, `stream_content_batch.py`:
    SSH connection's stdin to `<name>.part` in the hub's content
    directory, then renames it to `.jsonl` after a clean close and a
    byte-count check. The producer writes no body file locally.
-3. Records the batch as `awaiting_batch_received` in its state file
-   (metadata only) and sends a completion notice — metadata only:
-   batch id, file name, bytes, SHA-256, fetch time, new/context counts,
-   and shortfall flags. **The handed position does not move yet.**
-4. When the hub replies `batch_received` for the exact batch id (after
-   verifying file, size, hash, JSONL structure, and references), the
-   producer advances that conversation's position to the batch's newest
-   message timestamp (`--confirm <batch_id>`). Until then the
+3. When a receiver endpoint is configured, calls it over the same SSH
+   route after the file is final. Only an exit-0 response whose status
+   is `batch_received` for the exact batch id advances the
+   conversation's position to the batch's newest message timestamp.
+   The SHA-256 of the bytes actually streamed is passed to the
+   receiver, which verifies the file against it; if a response echoes
+   a SHA-256, it must match. An unclear, timed-out, or
+   non-zero result is not treated as success; the same batch id, file,
+   and hash are preserved.
+4. If the receiver is not configured or its acceptance does not
+   complete, records the batch as `awaiting_batch_received` in its
+   state file (metadata only) and sends a completion notice — metadata
+   only: batch id, file name, bytes, SHA-256, fetch time, new/context
+   counts, and shortfall flags. When the hub later replies
+   `batch_received` for the exact batch id, the producer advances the
+   position (`--confirm <batch_id>`). Until acceptance either way, the
    conversation is not re-batched, and later diffs are never skipped.
 
 ### Batch format
@@ -63,12 +71,20 @@ Then one line per message, oldest first:
 ```json
 {"type": "message", "message_ref": "<sha256 hex>",
  "sent_at_utc": "<ISO-8601 UTC>", "sender": "<name as at the source>",
+ "sender_key": "<sha256 hex or null>", "from_self": null,
  "text": "<original text>", "is_context": false,
  "has_attachment": false, "reaction_count": 0}
 ```
 
 - `message_ref` is a hash of (thread_key, timestamp, sender, text) —
   stable across fetches, and no raw source ID is exposed.
+- `sender_key` is the SHA-256 of the source's stable sender ID when one
+  is returned, otherwise null; no raw sender ID is exposed. `from_self`
+  is null unless the source explicitly provides a self flag or an
+  authenticated-account value to collate against — it is never inferred
+  from names or text. (The connector used by the reference producer
+  returns a stable sender ID but no explicit self field, so its
+  `from_self` is null.)
 - New messages and preceding context are distinguished by `is_context`.
 - A batch holds at most 500 message lines. If more new messages exist,
   the batch takes the oldest slice and sets `has_more`; the rest forms
@@ -85,6 +101,16 @@ It seeds the hub with the existing context. Receiving it means only
 that the retained range arrived — it does not mark anything read,
 answered, or reminded, and it never becomes a reason to skip later
 diffs.
+
+### Health signal
+
+Each stream run also atomically replaces
+`messenger-acquisition-health.json` in the hub's incoming status
+directory (mode 0600, no bodies): `source`, `schema_version`,
+`last_attempt_at`, `last_success_at`, `last_attempt_status`
+(`ok`/`error`), `last_content_change_at`, and `last_transfer_at`,
+with unknown values as null and all times in UTC ISO-8601. Source
+message times and observation times are kept distinct.
 
 ## 3. On-request fetch
 

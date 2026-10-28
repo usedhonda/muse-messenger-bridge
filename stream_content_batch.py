@@ -10,9 +10,11 @@ or DB on its own side. The local state file holds metadata only (thread
 keys, timestamps, batch records), never bodies.
 
 Discipline:
-- A conversation's handed position advances ONLY when the hub replies
-  batch_received for the exact batch_id (see --confirm). The completion
-  MSG (metadata only, no bodies) never advances it.
+- A conversation's handed position advances ONLY when the receiver
+  returns batch_received for the exact batch_id and SHA-256, either
+  through the receiver CLI wired into this script or through the hub's
+  MSG reply followed by --confirm. A completion MSG by itself (metadata
+  only, no bodies) never advances it.
 - Excess is never dropped: a batch holds at most CAP message lines;
   anything remaining stays above the handed position and forms the next
   batch (has_more marks this). A coverage shortfall is flagged, never
@@ -24,6 +26,7 @@ Discipline:
 import fcntl
 import hashlib
 import json
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -55,7 +58,13 @@ CLIENT = CONN_DIR / "bin" / "vm_client.py"
 CONFIG = CONN_DIR / "client.json"
 PARENT_MESSAGE = _LOCAL.get("notify_parent_message", "")  # hub thread anchor for completion notices
 REMOTE_DIR = _LOCAL.get("remote_content_dir", "/path/to/incoming/muse/content")
+REMOTE_STATUS_DIR = _LOCAL.get("remote_status_dir", "/path/to/incoming/muse")
 SSH_HOST = _LOCAL.get("ssh_host", "bridge-host")
+RECEIVER = _LOCAL.get("receiver") if isinstance(_LOCAL.get("receiver"), dict) else {}
+RECEIVER_CWD = RECEIVER.get("cwd")
+RECEIVER_ROOT = RECEIVER.get("root")
+RECEIVER_PYTHON = RECEIVER.get("python", "/usr/bin/python3")
+RECEIVER_MODULE = RECEIVER.get("module", "hub.messenger_relay")
 CONTEXT = 5
 CAP = 500
 
@@ -88,6 +97,13 @@ def load_state():
     state.setdefault("threads", {})
     state.setdefault("pending", {})
     state.setdefault("batches", {})
+    state.setdefault("health", {
+        "last_attempt_at": None,
+        "last_success_at": None,
+        "last_attempt_status": None,
+        "last_content_change_at": None,
+        "last_transfer_at": None,
+    })
     return state
 
 
@@ -95,6 +111,125 @@ def save_state(state):
     tmp = STATE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(STATE)
+
+
+def payload_sha(batch):
+    return hashlib.sha256(batch["payload"]).hexdigest()
+
+
+def sender_key(value):
+    if value is None or value == "":
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def health_state(state):
+    return state.setdefault("health", {
+        "last_attempt_at": None,
+        "last_success_at": None,
+        "last_attempt_status": None,
+        "last_content_change_at": None,
+        "last_transfer_at": None,
+    })
+
+
+def latest_content_change_iso():
+    if not DB.exists():
+        return None
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=60)
+    try:
+        row = con.execute("SELECT MAX(updated_at_utc) FROM messenger_thread_index").fetchone()
+    finally:
+        con.close()
+    return row[0] if row and row[0] else None
+
+
+def refresh_health_content_change(state):
+    health = health_state(state)
+    latest = latest_content_change_iso()
+    if latest and iso_to_ms(latest) > iso_to_ms(health.get("last_content_change_at")):
+        health["last_content_change_at"] = latest
+
+
+def write_health_file(state):
+    health = health_state(state)
+    obj = {
+        "source": "muse",
+        "schema_version": 1,
+        "last_attempt_at": health.get("last_attempt_at"),
+        "last_success_at": health.get("last_success_at"),
+        "last_attempt_status": health.get("last_attempt_status"),
+        "last_content_change_at": health.get("last_content_change_at"),
+        "last_transfer_at": health.get("last_transfer_at"),
+    }
+    payload = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    filename = "messenger-acquisition-health.json"
+    part = f"{REMOTE_STATUS_DIR}/{filename}.part"
+    final = f"{REMOTE_STATUS_DIR}/{filename}"
+    remote_cmd = (
+        f"umask 077 && mkdir -p {shlex.quote(REMOTE_STATUS_DIR)} && "
+        f"cat > {shlex.quote(part)} && chmod 0600 {shlex.quote(part)} && "
+        f"mv {shlex.quote(part)} {shlex.quote(final)} && wc -c < {shlex.quote(final)}"
+    )
+    proc = subprocess.run(
+        ["ssh", SSH_HOST, remote_cmd],
+        input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"health file write failed: {proc.stderr.decode('utf-8', 'replace')[:200]}")
+    remote_bytes = int(proc.stdout.decode().strip().split()[0])
+    if remote_bytes != len(payload):
+        raise RuntimeError(f"health byte mismatch: local {len(payload)} remote {remote_bytes}")
+    return filename
+
+
+def try_receiver_accept(batch, filename):
+    if not RECEIVER_CWD or not RECEIVER_ROOT:
+        return False, {"status": "not_configured"}
+    sha = payload_sha(batch)
+    remote_cmd = " && ".join([
+        f"cd {shlex.quote(str(RECEIVER_CWD))}",
+        " ".join([
+            shlex.quote(str(RECEIVER_PYTHON)),
+            "-m",
+            shlex.quote(str(RECEIVER_MODULE)),
+            "--root",
+            shlex.quote(str(RECEIVER_ROOT)),
+            "accept",
+            shlex.quote(filename),
+            "--sha256",
+            sha,
+        ]),
+    ])
+    try:
+        proc = subprocess.run(
+            ["ssh", SSH_HOST, remote_cmd],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+        )
+    except Exception as exc:
+        return False, {"status": "receiver_unknown", "error": type(exc).__name__}
+    if proc.returncode != 0:
+        return False, {"status": "receiver_error", "returncode": proc.returncode}
+    result = None
+    stdout = (proc.stdout or "").strip()
+    try:
+        result = json.loads(stdout)
+    except Exception:
+        for line in reversed(stdout.splitlines()):
+            try:
+                result = json.loads(line)
+                break
+            except Exception:
+                continue
+    if not isinstance(result, dict):
+        return False, {"status": "receiver_unknown"}
+    returned_sha = result.get("sha256")
+    accepted = (
+        result.get("status") == "batch_received"
+        and result.get("batch_id") == batch["batch_id"]
+        and (returned_sha is None or returned_sha == sha)
+    )
+    return accepted, result
 
 
 def call_tool(name, args):
@@ -155,6 +290,8 @@ def normalize_rows(rows):
         msgs.append({
             "ts_ms": int(ts),
             "sender": row.get("sender_name"),
+            "sender_key": sender_key(row.get("sender_id")),
+            "from_self": None,
             "text": row.get("body"),
             "has_attachment": bool(row.get("attachments")),
             "reaction_count": len(row.get("reactions") or []),
@@ -280,6 +417,8 @@ def message_line(thread_key, m, is_context):
         "message_ref": ref,
         "sent_at_utc": ms_to_iso(m["ts_ms"]),
         "sender": m["sender"],
+        "sender_key": m.get("sender_key"),
+        "from_self": m.get("from_self"),
         "text": m["text"],
         "is_context": is_context,
         "has_attachment": m["has_attachment"],
@@ -340,8 +479,9 @@ def send_completion_msg(batch, filename):
     return submission_id, result.get("hub_acceptance")
 
 
-def _run():
-    state = load_state()
+def _run(state=None):
+    if state is None:
+        state = load_state()
     # A thread with an unconfirmed batch is not re-batched this run.
     busy = {b["thread_key"] for b in state["batches"].values()}
     sent = 0
@@ -354,13 +494,28 @@ def _run():
             # Stats said changed but nothing newer was fetched; leave as is.
             continue
         filename = stream_to_mac(batch)
+        health_state(state)["last_transfer_at"] = now_iso()
+        accepted, receiver_result = try_receiver_accept(batch, filename)
+        if accepted:
+            entry = state["threads"].setdefault(key, {"last_handed_ts": 0})
+            if batch["upto_ms"] > entry.get("last_handed_ts", 0):
+                entry["last_handed_ts"] = batch["upto_ms"]
+            save_state(state)
+            print(f"auto-accepted {batch['batch_id']}; position advanced to {batch['upto_ms']}")
+            sent += 1
+            continue
+        if receiver_result.get("status") != "not_configured":
+            print(
+                f"receiver auto-accept not completed for {batch['batch_id']}: "
+                f"{receiver_result.get('status')}"
+            )
         submission_id, acceptance = send_completion_msg(batch, filename)
         state["batches"][batch["batch_id"]] = {
             "thread_key": key,
             "upto_ts": batch["upto_ms"],
             "filename": filename,
             "bytes": len(batch["payload"]),
-            "sha256": hashlib.sha256(batch["payload"]).hexdigest(),
+            "sha256": payload_sha(batch),
             "fetched_at_utc": batch["fetched_at_utc"],
             "new_count": batch["new_count"],
             "context_count": batch["context_count"],
@@ -373,10 +528,12 @@ def _run():
         save_state(state)
         sent += 1
     print(f"batches sent: {sent}")
+    return sent
 
 
-def _initial_context(thread_key):
-    state = load_state()
+def _initial_context(thread_key, state=None):
+    if state is None:
+        state = load_state()
     if any(b["thread_key"] == thread_key for b in state["batches"].values()):
         print("a batch is already awaiting confirmation for this thread")
         return 2
@@ -385,7 +542,33 @@ def _initial_context(thread_key):
         print("no messages fetched")
         return 2
     filename = stream_to_mac(batch)
-    sha = hashlib.sha256(batch["payload"]).hexdigest()
+    sha = payload_sha(batch)
+    health_state(state)["last_transfer_at"] = now_iso()
+    accepted, receiver_result = try_receiver_accept(batch, filename)
+    if accepted:
+        entry = state["threads"].setdefault(thread_key, {"last_handed_ts": 0})
+        if batch["upto_ms"] > entry.get("last_handed_ts", 0):
+            entry["last_handed_ts"] = batch["upto_ms"]
+        save_state(state)
+        print(json.dumps({
+            "batch_id": batch["batch_id"],
+            "filename": filename,
+            "bytes": len(batch["payload"]),
+            "sha256": sha,
+            "fetched_at_utc": batch["fetched_at_utc"],
+            "new_count": 0,
+            "context_count": batch["context_count"],
+            "has_more": batch["has_more"],
+            "shortfall": batch["shortfall"],
+            "receiver_status": receiver_result.get("status"),
+            "position_advanced": True,
+        }, ensure_ascii=False))
+        return 0
+    if receiver_result.get("status") != "not_configured":
+        print(
+            f"receiver auto-accept not completed for {batch['batch_id']}: "
+            f"{receiver_result.get('status')}"
+        )
     state["batches"][batch["batch_id"]] = {
         "thread_key": thread_key,
         "kind": "initial_context",
@@ -432,7 +615,32 @@ def run():
         if not acquired:
             print("another run in progress; skipped")
             return
-        _run()
+        state = load_state()
+        health = health_state(state)
+        health["last_attempt_at"] = now_iso()
+        refresh_health_content_change(state)
+        save_state(state)
+        try:
+            _run(state)
+        except Exception:
+            health = health_state(state)
+            health["last_attempt_status"] = "error"
+            refresh_health_content_change(state)
+            save_state(state)
+            try:
+                write_health_file(state)
+            except Exception as exc:
+                print(f"health file update failed: {exc}")
+            raise
+        health = health_state(state)
+        health["last_attempt_status"] = "ok"
+        health["last_success_at"] = now_iso()
+        refresh_health_content_change(state)
+        save_state(state)
+        try:
+            write_health_file(state)
+        except Exception as exc:
+            print(f"health file update failed: {exc}")
 
 
 def initial_context(thread_key):
