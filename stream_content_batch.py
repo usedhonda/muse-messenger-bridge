@@ -183,10 +183,9 @@ def write_health_file(state):
     return filename
 
 
-def try_receiver_accept(batch, filename):
+def try_receiver_accept(batch_id, sha, filename):
     if not RECEIVER_CWD or not RECEIVER_ROOT:
         return False, {"status": "not_configured"}
-    sha = payload_sha(batch)
     remote_cmd = " && ".join([
         f"cd {shlex.quote(str(RECEIVER_CWD))}",
         " ".join([
@@ -226,8 +225,9 @@ def try_receiver_accept(batch, filename):
     returned_sha = result.get("sha256")
     accepted = (
         result.get("status") == "batch_received"
-        and result.get("batch_id") == batch["batch_id"]
-        and (returned_sha is None or returned_sha == sha)
+        and result.get("batch_id") == batch_id
+        and returned_sha is not None
+        and returned_sha == sha
     )
     return accepted, result
 
@@ -498,9 +498,32 @@ def send_completion_msg(batch, filename):
     return submission_id, result.get("hub_acceptance")
 
 
+def retry_pending_accepts(state):
+    """Re-verify awaiting batches against the receiver with their
+    recorded file/hash; advance positions for any now accepted. A batch
+    is never rebuilt while its finalized file exists."""
+    advanced = 0
+    for batch_id, record in list(state["batches"].items()):
+        accepted, _result = try_receiver_accept(
+            batch_id, record.get("sha256"), record.get("filename")
+        )
+        if not accepted:
+            continue
+        entry = state["threads"].setdefault(record["thread_key"], {"last_handed_ts": 0})
+        if record["upto_ts"] > entry.get("last_handed_ts", 0):
+            entry["last_handed_ts"] = record["upto_ts"]
+        del state["batches"][batch_id]
+        advanced += 1
+        print(f"auto-accepted pending {batch_id}; position advanced to {record['upto_ts']}")
+    if advanced:
+        save_state(state)
+    return advanced
+
+
 def _run(state=None):
     if state is None:
         state = load_state()
+    retry_pending_accepts(state)
     # A thread with an unconfirmed batch is not re-batched this run.
     busy = {b["thread_key"] for b in state["batches"].values()}
     sent = 0
@@ -514,7 +537,7 @@ def _run(state=None):
             continue
         filename = stream_to_mac(batch)
         health_state(state)["last_transfer_at"] = now_iso()
-        accepted, receiver_result = try_receiver_accept(batch, filename)
+        accepted, receiver_result = try_receiver_accept(batch["batch_id"], payload_sha(batch), filename)
         if accepted:
             entry = state["threads"].setdefault(key, {"last_handed_ts": 0})
             if batch["upto_ms"] > entry.get("last_handed_ts", 0):
@@ -528,7 +551,10 @@ def _run(state=None):
                 f"receiver auto-accept not completed for {batch['batch_id']}: "
                 f"{receiver_result.get('status')}"
             )
-        submission_id, acceptance = send_completion_msg(batch, filename)
+        # Persist the pending record BEFORE the completion notice: if
+        # the notice fails, the finalized file's metadata survives and
+        # later runs re-verify the receiver against the same file/hash
+        # instead of rebuilding (which the no-overwrite guard rejects).
         state["batches"][batch["batch_id"]] = {
             "thread_key": key,
             "upto_ts": batch["upto_ms"],
@@ -540,10 +566,14 @@ def _run(state=None):
             "context_count": batch["context_count"],
             "has_more": batch["has_more"],
             "shortfall": batch["shortfall"],
-            "msg_submission_id": submission_id,
-            "msg_hub_acceptance": acceptance,
+            "msg_submission_id": None,
+            "msg_hub_acceptance": None,
             "state": "awaiting_batch_received",
         }
+        save_state(state)
+        submission_id, acceptance = send_completion_msg(batch, filename)
+        state["batches"][batch["batch_id"]]["msg_submission_id"] = submission_id
+        state["batches"][batch["batch_id"]]["msg_hub_acceptance"] = acceptance
         save_state(state)
         sent += 1
     print(f"batches sent: {sent}")
@@ -563,7 +593,7 @@ def _initial_context(thread_key, state=None):
     filename = stream_to_mac(batch)
     sha = payload_sha(batch)
     health_state(state)["last_transfer_at"] = now_iso()
-    accepted, receiver_result = try_receiver_accept(batch, filename)
+    accepted, receiver_result = try_receiver_accept(batch["batch_id"], sha, filename)
     if accepted:
         entry = state["threads"].setdefault(thread_key, {"last_handed_ts": 0})
         if batch["upto_ms"] > entry.get("last_handed_ts", 0):
