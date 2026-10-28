@@ -21,11 +21,13 @@ Discipline:
   conversations are handled in the same run, oldest change first.
 """
 
+import fcntl
 import hashlib
 import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -289,6 +291,14 @@ def stream_to_mac(batch):
     filename = f"muse-content-{batch['batch_id']}.jsonl"
     part = f"{REMOTE_DIR}/{filename}.part"
     final = f"{REMOTE_DIR}/{filename}"
+    exists = subprocess.run(
+        ["ssh", SSH_HOST, f"test -e '{final}'"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+    )
+    if exists.returncode == 0:
+        raise RuntimeError(
+            f"remote file already exists for {batch['batch_id']}; refusing to overwrite"
+        )
     remote_cmd = (
         f"umask 077 && mkdir -p '{REMOTE_DIR}' && cat > '{part}' && "
         f"mv '{part}' '{final}' && wc -c < '{final}'"
@@ -330,7 +340,7 @@ def send_completion_msg(batch, filename):
     return submission_id, result.get("hub_acceptance")
 
 
-def run():
+def _run():
     state = load_state()
     # A thread with an unconfirmed batch is not re-batched this run.
     busy = {b["thread_key"] for b in state["batches"].values()}
@@ -365,7 +375,7 @@ def run():
     print(f"batches sent: {sent}")
 
 
-def initial_context(thread_key):
+def _initial_context(thread_key):
     state = load_state()
     if any(b["thread_key"] == thread_key for b in state["batches"].values()):
         print("a batch is already awaiting confirmation for this thread")
@@ -403,6 +413,34 @@ def initial_context(thread_key):
         "shortfall": batch["shortfall"],
     }, ensure_ascii=False))
     return 0
+
+
+@contextmanager
+def single_run():
+    lock_path = BASE / "stream_content_batch.lock"
+    with open(lock_path, "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def run():
+    with single_run() as acquired:
+        if not acquired:
+            print("another run in progress; skipped")
+            return
+        _run()
+
+
+def initial_context(thread_key):
+    with single_run() as acquired:
+        if not acquired:
+            print("another run in progress; skipped")
+            return 2
+        return _initial_context(thread_key)
 
 
 def confirm(batch_id):
