@@ -1,0 +1,1 @@
+{"messenger_cli":"/path/to/messenger_cli","notify_parent_message":"00000000-0000-0000-0000-000000000000","remote_content_dir":"/path/to/incoming/muse/content","remote_status_dir":"/path/to/incoming/muse","ssh_host":"bridge-host","tproj_connector_dir":"/path/to/custom-connectors/custom.tproj"}

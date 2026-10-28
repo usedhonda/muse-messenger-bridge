@@ -1,0 +1,9 @@
+# Runtime material — never committed. This repository is the code and the
+# protocol, not what flowed over the bridge.
+*.sqlite
+*.sqlite3
+*-state.json
+bridge.local.json
+exports/
+__pycache__/
+*.part
