@@ -281,7 +281,26 @@ def changed_threads(state):
     return out
 
 
+_SELF_ID = False  # False = unresolved, None = unavailable
+
+
+def self_id():
+    """The authenticated account's stable ID, from the connector's own
+    check function. Used only as a collation basis for from_self; the
+    raw value never leaves this side."""
+    global _SELF_ID
+    if _SELF_ID is False:
+        try:
+            data = ftc.run_cli(["check"])
+            value = (data.get("data") or {}).get("user_id")
+            _SELF_ID = str(value) if value is not None else None
+        except Exception:
+            _SELF_ID = None
+    return _SELF_ID
+
+
 def normalize_rows(rows):
+    owner = self_id()
     msgs = []
     for row in rows:
         ts = row.get("timestamp")
@@ -291,7 +310,7 @@ def normalize_rows(rows):
             "ts_ms": int(ts),
             "sender": row.get("sender_name"),
             "sender_key": sender_key(row.get("sender_id")),
-            "from_self": None,
+            "from_self": (str(row.get("sender_id")) == owner) if (owner is not None and row.get("sender_id") is not None) else None,
             "text": row.get("body"),
             "has_attachment": bool(row.get("attachments")),
             "reaction_count": len(row.get("reactions") or []),

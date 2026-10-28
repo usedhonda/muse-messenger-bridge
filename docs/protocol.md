@@ -82,9 +82,10 @@ Then one line per message, oldest first:
   is returned, otherwise null; no raw sender ID is exposed. `from_self`
   is null unless the source explicitly provides a self flag or an
   authenticated-account value to collate against — it is never inferred
-  from names or text. (The connector used by the reference producer
-  returns a stable sender ID but no explicit self field, so its
-  `from_self` is null.)
+  from names or text. (The reference producer collates `sender_id`
+  against the authenticated account ID returned by the connector's
+  own `check` function; when that basis is unavailable, `from_self`
+  is null.)
 - New messages and preceding context are distinguished by `is_context`.
 - A batch holds at most 500 message lines. If more new messages exist,
   the batch takes the oldest slice and sets `has_more`; the rest forms
