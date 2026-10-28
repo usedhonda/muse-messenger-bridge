@@ -40,18 +40,23 @@ ahead of its handed position, `stream_content_batch.py`:
    is `batch_received` for the exact batch id advances the
    conversation's position to the batch's newest message timestamp.
    The SHA-256 of the bytes actually streamed is passed to the
-   receiver, which verifies the file against it; if a response echoes
-   a SHA-256, it must match. An unclear, timed-out, or
+   receiver, which verifies the file against it and echoes it in the
+   response; a missing or different echoed SHA-256 is not
+   acceptance. An unclear, timed-out, or
    non-zero result is not treated as success; the same batch id, file,
    and hash are preserved.
 4. If the receiver is not configured or its acceptance does not
    complete, records the batch as `awaiting_batch_received` in its
-   state file (metadata only) and sends a completion notice — metadata
+   state file (metadata only) — the record is persisted before the
+   notice is sent, so a failed notice cannot strand a finalized
+   file — and sends a completion notice — metadata
    only: batch id, file name, bytes, SHA-256, fetch time, new/context
    counts, and shortfall flags. When the hub later replies
    `batch_received` for the exact batch id, the producer advances the
    position (`--confirm <batch_id>`). Until acceptance either way, the
    conversation is not re-batched, and later diffs are never skipped.
+   On later runs, awaiting batches are first re-verified against the
+   receiver with the same file and hash rather than rebuilt.
 
 ### Batch format
 
