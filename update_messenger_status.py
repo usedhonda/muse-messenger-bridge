@@ -289,9 +289,13 @@ def main():
                     if not isinstance(call, dict):
                         continue
                     call_key = hashlib.sha256(json.dumps(call, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-                    started = call.get("timestamp") or call.get("started_at") or call.get("start_time") or call.get("time")
+                    raw_started = call.get("call_started_at") or call.get("timestamp") or call.get("started_at") or call.get("start_time") or call.get("time")
+                    if isinstance(raw_started, dict):
+                        call_started = raw_started.get("utc") or raw_started.get("user_local")
+                    else:
+                        call_started = raw_started
                     counterparty = call.get("counterparty_name") or call.get("caller_name") or call.get("callee_name") or call.get("name")
-                    duration = call.get("duration_seconds") or call.get("duration")
+                    duration = call.get("call_duration_seconds") or call.get("duration_seconds") or call.get("duration")
                     con.execute(
                         """
                         INSERT OR REPLACE INTO messenger_calls (
@@ -301,9 +305,9 @@ def main():
                         """,
                         (
                             call_key,
-                            ms_to_iso(started) if isinstance(started, (int, float)) else None,
+                            ms_to_iso(call_started) if isinstance(call_started, (int, float)) else (call_started if isinstance(call_started, str) else None),
                             call.get("direction"),
-                            call.get("call_type") or call.get("type"),
+                            call.get("call_type") or call.get("type") or call.get("event"),
                             duration if isinstance(duration, (int, float)) else None,
                             1 if call.get("missed") is True else 0,
                             counterparty if isinstance(counterparty, str) else None,
