@@ -46,6 +46,20 @@ silent on success, backing off 10 minutes after a failure and surfacing
 only real failures. See `docs/protocol.md` for the handover protocol and
 `docs/schema.md` for the status DB schema.
 
+### On-request context completeness
+
+The fetch JSON includes `context_truncation` with `truncated` and `reason`:
+`cap` means the configured cap omitted requested context or stopped paging
+before completeness was established; `pagination_stalled` means paging
+stopped making progress. A complete observed window reports `false` and
+`null`. The default window is at least 100 recent messages plus everything
+within seven days, up to 500 messages. `--days 0` reads retained context up
+to the cap. Limits must satisfy `1 <= limit <= cap` and `days >= 0`.
+Source failures use a nonzero exit and sanitized diagnostics; each
+Messenger CLI call has a 120-second timeout. See
+[fetch validation and limitations](docs/repofix-fetch-context.md) for the
+timestamp-only paging limitation and isolated regression command.
+
 ## Rules the bridge runs by
 
 - The status DB contains **no message bodies, no snippets, no raw IDs**.
