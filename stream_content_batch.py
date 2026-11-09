@@ -445,22 +445,68 @@ def message_line(thread_key, m, is_context):
     }
 
 
+# Executed on the receiver through the configured Python interpreter. The
+# producer still sends bodies only through SSH stdin, never a local body file.
+REMOTE_CONTENT_WRITER = r'''
+import hashlib
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+def publish():
+    directory, filename, expected_size, expected_sha = sys.argv[1:]
+    if Path(filename).name != filename or filename in {".", ".."}:
+        raise ValueError("invalid batch filename")
+    expected_size = int(expected_size)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".muse-content-", suffix=".part", dir=directory)
+    try:
+        total = 0
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "wb") as output:
+            while True:
+                chunk = sys.stdin.buffer.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > expected_size:
+                    raise ValueError("batch size mismatch")
+                output.write(chunk)
+                digest.update(chunk)
+            if total != expected_size or digest.hexdigest() != expected_sha:
+                raise ValueError("batch integrity mismatch")
+            output.flush()
+            os.fsync(output.fileno())
+        # link creates the final name atomically and fails if any entry exists.
+        # An existence check followed by rename would overwrite a racing writer.
+        os.link(temporary, os.path.join(directory, filename))
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        print(total)
+    finally:
+        os.unlink(temporary)
+
+try:
+    publish()
+except Exception as error:
+    # No payload bytes or deployment-specific path appears in diagnostics.
+    print("content publication failed: " + type(error).__name__, file=sys.stderr)
+    raise SystemExit(1)
+'''
+
+
 def stream_to_mac(batch):
     filename = f"muse-content-{batch['batch_id']}.jsonl"
-    part = f"{REMOTE_DIR}/{filename}.part"
-    final = f"{REMOTE_DIR}/{filename}"
-    exists = subprocess.run(
-        ["ssh", SSH_HOST, f"test -e '{final}'"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
-    )
-    if exists.returncode == 0:
-        raise RuntimeError(
-            f"remote file already exists for {batch['batch_id']}; refusing to overwrite"
-        )
-    remote_cmd = (
-        f"umask 077 && mkdir -p '{REMOTE_DIR}' && cat > '{part}' && "
-        f"mv '{part}' '{final}' && wc -c < '{final}'"
-    )
+    if Path(filename).name != filename or "\0" in filename:
+        raise ValueError("invalid batch filename")
+    remote_cmd = " ".join(shlex.quote(str(value)) for value in (
+        RECEIVER_PYTHON, "-c", REMOTE_CONTENT_WRITER, REMOTE_DIR,
+        filename, len(batch["payload"]), payload_sha(batch),
+    ))
     proc = subprocess.run(
         ["ssh", SSH_HOST, remote_cmd],
         input=batch["payload"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,

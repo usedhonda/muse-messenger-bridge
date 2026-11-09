@@ -69,6 +69,11 @@ from `bridge.local.json` next to the scripts. The repository ships
 `config.example.json` with placeholder values only; the real file is
 git-ignored.
 
+Content publication uses the configured `receiver.python` interpreter (default
+`/usr/bin/python3`) even for manually confirmed handovers. The receiver's content
+directory must support same-directory hard links so existing batch files cannot
+be overwritten. See [content publication validation](docs/repofix-content-publication.md).
+
 ## What is not in this repository
 
 The live database, state files, deposited snapshots, batch files, and
