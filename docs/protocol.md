@@ -9,7 +9,12 @@ the bridge.
 - The producer rebuilds the status DB every minute (deep collection
   hourly) in a single transaction per run: index rebuild, snapshot
   append, and update log commit together, so a backup never catches a
-  half-written state.
+  half-written state. A failed source command, malformed collection, or failed
+  deep refresh rolls back the run and preserves the previous status. Failure
+  health is recorded in the selected database with a sanitized error; each
+  source command has a 120-second timeout. Every successful run creates the
+  complete schema; shallow runs leave uncollected deep tables empty so the
+  receiver can query them without inventing message statistics.
 - `deposit_snapshot.py` hashes the *stable* content (status counts,
   thread index, per-thread stats, contacts, calls, stable meta —
   capture timestamps and history tables excluded). Only when that hash
