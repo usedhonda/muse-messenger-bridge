@@ -26,6 +26,7 @@ Discipline:
 import fcntl
 import hashlib
 import json
+import os
 import shlex
 import sqlite3
 import subprocess
@@ -109,8 +110,18 @@ def load_state():
 
 def save_state(state):
     tmp = STATE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), 0o600)
+        json.dump(state, fh, ensure_ascii=False, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
     tmp.replace(STATE)
+    directory = os.open(STATE.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def payload_sha(batch):
@@ -274,8 +285,9 @@ def changed_threads(state):
     out = []
     for key, updated_iso in rows:
         updated_ms = iso_to_ms(updated_iso)
-        handed = state["threads"].get(key, {}).get("last_handed_ts", 0)
-        if updated_ms > handed:
+        entry = state["threads"].get(key, {})
+        handed = entry.get("last_handed_ts", 0)
+        if updated_ms > handed or entry.get("has_more", False):
             out.append((handed, key, updated_ms))
     out.sort()  # oldest handed position first
     return out
@@ -299,35 +311,55 @@ def self_id():
     return _SELF_ID
 
 
-def normalize_rows(rows):
+def normalize_rows(rows, thread_key=None):
     owner = self_id()
     msgs = []
+    seen = {}
     for row in rows:
         ts = row.get("timestamp")
         if not isinstance(ts, (int, float)):
             continue
-        msgs.append({
+        body = row.get("body")
+        if body is None:
+            body = ""
+        elif not isinstance(body, str):
+            raise RuntimeError("message body must be a string or null")
+        message = {
             "ts_ms": int(ts),
             "sender": row.get("sender_name"),
             "sender_key": sender_key(row.get("sender_id")),
             "from_self": (str(row.get("sender_id")) == owner) if (owner is not None and row.get("sender_id") is not None) else None,
-            "text": row.get("body"),
+            "text": body,
             "has_attachment": bool(row.get("attachments")),
             "reaction_count": len(row.get("reactions") or []),
-        })
+        }
+        if thread_key is not None:
+            ref = message_line(thread_key, message, False)["message_ref"]
+            previous = seen.get(ref)
+            if previous is not None:
+                if previous != message:
+                    raise RuntimeError("conflicting messages share a message_ref")
+                continue
+            seen[ref] = message
+        msgs.append(message)
     msgs.sort(key=lambda m: m["ts_ms"])
     return msgs
 
 
-def build_batch(thread_key, handed_ms):
+def build_batch(thread_key, handed_ms, handed_refs=None):
     cid, _thread = ftc.resolve_conversation(thread_key)
     if not cid:
         raise RuntimeError(f"thread_key not in current listing: {thread_key[:8]}")
     ftc.run_cli(["sync", "messages", "--cid", cid])
     # Latest CAP messages, no day window: the split below is by timestamp.
     _meta, rows = ftc.fetch_window(cid, 1, 0, CAP)
-    msgs = normalize_rows(rows)
-    new = [m for m in msgs if m["ts_ms"] > handed_ms]
+    msgs = normalize_rows(rows, thread_key)
+    msgs.sort(key=lambda m: (m["ts_ms"], message_ref(thread_key, m)))
+    known = set(handed_refs or [])
+    new = [m for m in msgs if m["ts_ms"] > handed_ms or (
+        handed_refs is not None and m["ts_ms"] == handed_ms
+        and message_ref(thread_key, m) not in known
+    )]
     if not new:
         return None
     room = CAP - 1  # header line
@@ -335,9 +367,13 @@ def build_batch(thread_key, handed_ms):
     first_new_idx = msgs.index(take_new[0])
     context = msgs[max(0, first_new_idx - CONTEXT):first_new_idx]
     has_more = len(new) > len(take_new)
-    shortfall = bool(msgs) and handed_ms > 0 and msgs[0]["ts_ms"] > handed_ms and len(msgs) >= CAP
+    truncated = (_meta.get("context_truncation") or {}).get("truncated") is True
+    shortfall = bool(msgs) and msgs[0]["ts_ms"] > handed_ms and (
+        truncated or (handed_ms > 0 and len(rows) >= CAP)
+    )
     upto_ms = take_new[-1]["ts_ms"]
-    batch_id = f"muse-c-{thread_key[:8]}-{upto_ms}"
+    batch_id = batch_identity(thread_key, upto_ms, take_new)
+    upto_refs = sorted({message_ref(thread_key, m) for m in take_new if m["ts_ms"] == upto_ms})
     fetched_at = now_iso()
     lines = [{
         "type": "batch",
@@ -363,6 +399,7 @@ def build_batch(thread_key, handed_ms):
         "batch_id": batch_id,
         "thread_key": thread_key,
         "upto_ms": upto_ms,
+        "upto_refs": upto_refs,
         "fetched_at_utc": fetched_at,
         "new_count": len(take_new),
         "context_count": len(context),
@@ -385,13 +422,15 @@ def build_initial_batch(thread_key):
         raise RuntimeError(f"thread_key not in current listing: {thread_key[:8]}")
     ftc.run_cli(["sync", "messages", "--cid", cid])
     _meta, rows = ftc.fetch_window(cid, 1, 0, CAP)
-    msgs = normalize_rows(rows)
+    msgs = normalize_rows(rows, thread_key)
+    msgs.sort(key=lambda m: (m["ts_ms"], message_ref(thread_key, m)))
     if not msgs:
         return None
     upto_ms = msgs[-1]["ts_ms"]
-    batch_id = f"muse-c-{thread_key[:8]}-initial-{upto_ms}"
+    batch_id = batch_identity(thread_key, upto_ms, msgs, initial=True)
     fetched_at = now_iso()
-    shortfall = bool(retained is not None and retained > len(msgs))
+    truncated = (_meta.get("context_truncation") or {}).get("truncated") is True
+    shortfall = bool(retained is not None and retained > len(msgs)) or truncated
     lines = [{
         "type": "batch",
         "batch_kind": "initial_context",
@@ -418,6 +457,7 @@ def build_initial_batch(thread_key):
         "batch_id": batch_id,
         "thread_key": thread_key,
         "upto_ms": upto_ms,
+        "upto_refs": sorted({message_ref(thread_key, m) for m in msgs if m["ts_ms"] == upto_ms}),
         "fetched_at_utc": fetched_at,
         "new_count": 0,
         "context_count": len(msgs),
@@ -427,13 +467,26 @@ def build_initial_batch(thread_key):
     }
 
 
-def message_line(thread_key, m, is_context):
-    ref = hashlib.sha256(
+def message_ref(thread_key, m):
+    return hashlib.sha256(
         f"{thread_key}|{m['ts_ms']}|{m['sender']}|{m['text']}".encode("utf-8")
     ).hexdigest()
+
+
+def batch_identity(thread_key, upto_ms, messages, initial=False):
+    # The timestamp alone cannot distinguish capped slices that end at
+    # the same millisecond. Include the full thread key and selected refs
+    # without changing the existing message_ref format.
+    refs = [message_ref(thread_key, m) for m in messages]
+    digest = hashlib.sha256("\n".join([thread_key, *refs]).encode("utf-8")).hexdigest()
+    kind = "initial-" if initial else ""
+    return f"muse-c-{thread_key[:8]}-{kind}{upto_ms}-{digest}"
+
+
+def message_line(thread_key, m, is_context):
     return {
         "type": "message",
-        "message_ref": ref,
+        "message_ref": message_ref(thread_key, m),
         "sent_at_utc": ms_to_iso(m["ts_ms"]),
         "sender": m["sender"],
         "sender_key": m.get("sender_key"),
@@ -498,24 +551,99 @@ def send_completion_msg(batch, filename):
     return submission_id, result.get("hub_acceptance")
 
 
+def transfer_pending_batch(state, batch, kind=None):
+    """Reserve the exact identity durably before any remote side effect.
+
+    A timeout can occur after the receiver-side file is finalized. Keep
+    its metadata even then: subsequent runs verify this identity rather
+    than rebuild a new payload or replay an uncertain transfer.
+    """
+    filename = f"muse-content-{batch['batch_id']}.jsonl"
+    record = {
+        "thread_key": batch["thread_key"],
+        "upto_ts": batch["upto_ms"],
+        "upto_refs": batch.get("upto_refs"),
+        "filename": filename,
+        "bytes": len(batch["payload"]),
+        "sha256": payload_sha(batch),
+        "fetched_at_utc": batch["fetched_at_utc"],
+        "new_count": batch["new_count"],
+        "context_count": batch["context_count"],
+        "has_more": batch["has_more"],
+        "shortfall": batch["shortfall"],
+        "msg_submission_id": None,
+        "msg_hub_acceptance": None,
+        "state": "transferring",
+    }
+    if kind is not None:
+        record["kind"] = kind
+    state["batches"][batch["batch_id"]] = record
+    save_state(state)
+    try:
+        stream_to_mac(batch)
+    except Exception:
+        record["state"] = "transfer_unknown"
+        save_state(state)
+        raise
+    record["state"] = "awaiting_batch_received"
+    health_state(state)["last_transfer_at"] = now_iso()
+    save_state(state)
+    return filename
+
+
+def advance_checkpoint(state, key, upto_ts, upto_refs=None, has_more=False):
+    """Advance only an acknowledged position, retaining ties at its edge.
+
+    Older state has no boundary refs. Preserve its timestamp-only
+    semantics until a newer timestamp is accepted, rather than replaying
+    messages that an earlier version already handed over.
+    """
+    entry = state["threads"].setdefault(key, {"last_handed_ts": 0})
+    previous = entry.get("last_handed_ts", 0)
+    if upto_ts < previous:
+        return
+    if upto_ts > previous:
+        entry["last_handed_ts"] = upto_ts
+        entry.pop("last_handed_refs", None)
+        if upto_refs is not None:
+            entry["last_handed_refs"] = sorted(set(upto_refs))
+    elif upto_refs is not None and ("last_handed_refs" in entry or previous == 0):
+        entry["last_handed_refs"] = sorted(set(entry.get("last_handed_refs", [])) | set(upto_refs))
+    entry["has_more"] = bool(has_more)
+
+
 def retry_pending_accepts(state):
     """Re-verify awaiting batches against the receiver with their
     recorded file/hash; advance positions for any now accepted. A batch
     is never rebuilt while its finalized file exists."""
     advanced = 0
+    changed = False
     for batch_id, record in list(state["batches"].items()):
         accepted, _result = try_receiver_accept(
             batch_id, record.get("sha256"), record.get("filename")
         )
         if not accepted:
+            # An interrupted notice may already be committed. Diagnose
+            # its original submission ID; never send it a second time.
+            submission_id = record.get("msg_submission_id")
+            if submission_id and record.get("msg_hub_acceptance") != "committed":
+                try:
+                    result = diagnose(submission_id)
+                except Exception:
+                    result = {"hub_acceptance": "unknown"}
+                acceptance = result.get("hub_acceptance", "unknown")
+                if acceptance != record.get("msg_hub_acceptance"):
+                    record["msg_hub_acceptance"] = acceptance
+                    changed = True
             continue
-        entry = state["threads"].setdefault(record["thread_key"], {"last_handed_ts": 0})
-        if record["upto_ts"] > entry.get("last_handed_ts", 0):
-            entry["last_handed_ts"] = record["upto_ts"]
+        advance_checkpoint(
+            state, record["thread_key"], record["upto_ts"], record.get("upto_refs"),
+            record.get("has_more", False) and record.get("kind") != "initial_context",
+        )
         del state["batches"][batch_id]
         advanced += 1
         print(f"auto-accepted pending {batch_id}; position advanced to {record['upto_ts']}")
-    if advanced:
+    if advanced or changed:
         save_state(state)
     return advanced
 
@@ -530,18 +658,19 @@ def _run(state=None):
     for _handed, key, _newest in changed_threads(state):
         if key in busy:
             continue
-        handed = state["threads"].get(key, {}).get("last_handed_ts", 0)
-        batch = build_batch(key, handed)
+        entry = state["threads"].get(key, {})
+        handed = entry.get("last_handed_ts", 0)
+        batch = build_batch(key, handed, entry.get("last_handed_refs"))
         if batch is None:
             # Stats said changed but nothing newer was fetched; leave as is.
             continue
-        filename = stream_to_mac(batch)
-        health_state(state)["last_transfer_at"] = now_iso()
+        filename = transfer_pending_batch(state, batch)
         accepted, receiver_result = try_receiver_accept(batch["batch_id"], payload_sha(batch), filename)
         if accepted:
-            entry = state["threads"].setdefault(key, {"last_handed_ts": 0})
-            if batch["upto_ms"] > entry.get("last_handed_ts", 0):
-                entry["last_handed_ts"] = batch["upto_ms"]
+            advance_checkpoint(
+                state, key, batch["upto_ms"], batch.get("upto_refs"), batch["has_more"]
+            )
+            del state["batches"][batch["batch_id"]]
             save_state(state)
             print(f"auto-accepted {batch['batch_id']}; position advanced to {batch['upto_ms']}")
             sent += 1
@@ -551,25 +680,12 @@ def _run(state=None):
                 f"receiver auto-accept not completed for {batch['batch_id']}: "
                 f"{receiver_result.get('status')}"
             )
-        # Persist the pending record BEFORE the completion notice: if
-        # the notice fails, the finalized file's metadata survives and
-        # later runs re-verify the receiver against the same file/hash
-        # instead of rebuilding (which the no-overwrite guard rejects).
-        state["batches"][batch["batch_id"]] = {
-            "thread_key": key,
-            "upto_ts": batch["upto_ms"],
-            "filename": filename,
-            "bytes": len(batch["payload"]),
-            "sha256": payload_sha(batch),
-            "fetched_at_utc": batch["fetched_at_utc"],
-            "new_count": batch["new_count"],
-            "context_count": batch["context_count"],
-            "has_more": batch["has_more"],
-            "shortfall": batch["shortfall"],
-            "msg_submission_id": None,
-            "msg_hub_acceptance": None,
-            "state": "awaiting_batch_received",
-        }
+        # Persist the notice identity before attempting submission too.
+        # A lost response is diagnosed by this ID on the next run.
+        state["batches"][batch["batch_id"]]["msg_submission_id"] = (
+            f"muse-dh-stream-{batch['batch_id']}"
+        )
+        state["batches"][batch["batch_id"]]["msg_hub_acceptance"] = "unknown"
         save_state(state)
         submission_id, acceptance = send_completion_msg(batch, filename)
         state["batches"][batch["batch_id"]]["msg_submission_id"] = submission_id
@@ -586,18 +702,20 @@ def _initial_context(thread_key, state=None):
     if any(b["thread_key"] == thread_key for b in state["batches"].values()):
         print("a batch is already awaiting confirmation for this thread")
         return 2
+    entry = state["threads"].get(thread_key, {})
+    if entry.get("last_handed_ts", 0) > 0 or "last_handed_refs" in entry:
+        print("initial context is only available before the first acknowledged batch")
+        return 2
     batch = build_initial_batch(thread_key)
     if batch is None:
         print("no messages fetched")
         return 2
-    filename = stream_to_mac(batch)
+    filename = transfer_pending_batch(state, batch, kind="initial_context")
     sha = payload_sha(batch)
-    health_state(state)["last_transfer_at"] = now_iso()
     accepted, receiver_result = try_receiver_accept(batch["batch_id"], sha, filename)
     if accepted:
-        entry = state["threads"].setdefault(thread_key, {"last_handed_ts": 0})
-        if batch["upto_ms"] > entry.get("last_handed_ts", 0):
-            entry["last_handed_ts"] = batch["upto_ms"]
+        advance_checkpoint(state, thread_key, batch["upto_ms"], batch.get("upto_refs"))
+        del state["batches"][batch["batch_id"]]
         save_state(state)
         print(json.dumps({
             "batch_id": batch["batch_id"],
@@ -618,21 +736,6 @@ def _initial_context(thread_key, state=None):
             f"receiver auto-accept not completed for {batch['batch_id']}: "
             f"{receiver_result.get('status')}"
         )
-    state["batches"][batch["batch_id"]] = {
-        "thread_key": thread_key,
-        "kind": "initial_context",
-        "upto_ts": batch["upto_ms"],
-        "filename": filename,
-        "bytes": len(batch["payload"]),
-        "sha256": sha,
-        "fetched_at_utc": batch["fetched_at_utc"],
-        "new_count": 0,
-        "context_count": batch["context_count"],
-        "has_more": batch["has_more"],
-        "shortfall": batch["shortfall"],
-        "state": "awaiting_batch_received",
-    }
-    save_state(state)
     print(json.dumps({
         "batch_id": batch["batch_id"],
         "filename": filename,
@@ -700,20 +803,29 @@ def initial_context(thread_key):
         return _initial_context(thread_key)
 
 
-def confirm(batch_id):
+def _confirm(batch_id):
     state = load_state()
     batch = state["batches"].get(batch_id)
     if not batch:
         print(f"unknown batch: {batch_id}")
         return 2
     key = batch["thread_key"]
-    entry = state["threads"].setdefault(key, {"last_handed_ts": 0})
-    if batch["upto_ts"] > entry.get("last_handed_ts", 0):
-        entry["last_handed_ts"] = batch["upto_ts"]
+    advance_checkpoint(
+        state, key, batch["upto_ts"], batch.get("upto_refs"),
+        batch.get("has_more", False) and batch.get("kind") != "initial_context",
+    )
     del state["batches"][batch_id]
     save_state(state)
     print(f"confirmed {batch_id}; position advanced to {batch['upto_ts']}")
     return 0
+
+
+def confirm(batch_id):
+    with single_run() as acquired:
+        if not acquired:
+            print("another run in progress; confirmation not applied")
+            return 2
+        return _confirm(batch_id)
 
 
 def list_pending():

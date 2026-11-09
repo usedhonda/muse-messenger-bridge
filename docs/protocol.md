@@ -31,8 +31,11 @@ When the status DB's thread index shows a conversation's activity time
 ahead of its handed position, `stream_content_batch.py`:
 
 1. Refreshes that one conversation at the source and reads it live.
-2. Builds one UTF-8 JSONL batch **in memory** and pipes it through the
-   SSH connection's stdin to `<name>.part` in the hub's content
+2. Builds one UTF-8 JSONL batch **in memory** and durably records its
+   exact batch id, file name, byte count, SHA-256, and coverage metadata
+   locally before starting any remote operation. No bodies enter this
+   state file. It then pipes the batch through the SSH connection's
+   stdin to `<name>.part` in the hub's content
    directory, then renames it to `.jsonl` after a clean close and a
    byte-count check. The producer writes no body file locally.
 3. When a receiver endpoint is configured, calls it over the same SSH
@@ -44,26 +47,34 @@ ahead of its handed position, `stream_content_batch.py`:
    response; a missing or different echoed SHA-256 is not
    acceptance. An unclear, timed-out, or
    non-zero result is not treated as success; the same batch id, file,
-   and hash are preserved.
+   and hash are preserved. A transfer timeout also preserves this
+   record, with `transfer_unknown` status: the file may already be
+   final, so later runs verify the recorded identity rather than fetch
+   a replacement or stream it again. An interrupted process may leave
+   `transferring`, which is handled with the same caution.
 4. If the receiver is not configured or its acceptance does not
    complete, records the batch as `awaiting_batch_received` in its
-   state file (metadata only) — the record is persisted before the
-   notice is sent, so a failed notice cannot strand a finalized
-   file — and sends a completion notice — metadata
+   state file (metadata only) and sends a completion notice — metadata
    only: batch id, file name, bytes, SHA-256, fetch time, new/context
    counts, and shortfall flags. When the hub later replies
    `batch_received` for the exact batch id, the producer advances the
-   position (`--confirm <batch_id>`). Until acceptance either way, the
+   position (`--confirm <batch_id>`). Confirmation takes the same
+   process lock as a stream run, so it cannot overwrite concurrent
+   pending-state changes. Until acceptance either way, the
    conversation is not re-batched, and later diffs are never skipped.
    On later runs, awaiting batches are first re-verified against the
    receiver with the same file and hash rather than rebuilt.
+   The notice submission id is persisted before the notice is sent;
+   a lost notice response is diagnosed with that same id on later
+   runs and is never blindly submitted again. Unknown transfers whose
+   files cannot be accepted remain pending for operator investigation.
 
 ### Batch format
 
 First line, a header:
 
 ```json
-{"type": "batch", "batch_id": "muse-c-<thread_key[:8]>-<newest_ts_ms>",
+{"type": "batch", "batch_id": "muse-c-<thread_key[:8]>-<newest_ts_ms>-<selection_sha256>",
  "source": "muse", "thread_key": "<sha256 hex>",
  "fetched_at_utc": "<ISO-8601 UTC>",
  "coverage": {"from_utc": "...", "to_utc": "...",
@@ -83,6 +94,16 @@ Then one line per message, oldest first:
 
 - `message_ref` is a hash of (thread_key, timestamp, sender, text) —
   stable across fetches, and no raw source ID is exposed.
+- `text` is always a string. Missing or null source bodies (for example,
+  attachment-only messages) are represented by an empty string; other
+  non-string body shapes fail before transfer. Original string bodies
+  and their existing reference hashes are preserved.
+- Repeated rows with an identical published message identity and identical
+  normalized fields are emitted once, before applying batch limits. If
+  different content or sender metadata produces the same existing ref,
+  collection fails without echoing the content or choosing a row to drop.
+  The bridge's published identity remains content based; distinct source
+  ids alone do not create distinct references for otherwise identical rows.
 - `sender_key` is the SHA-256 of the source's stable sender ID when one
   is returned, otherwise null; no raw sender ID is exposed. `from_self`
   is null unless the source explicitly provides a self flag or an
@@ -92,6 +113,15 @@ Then one line per message, oldest first:
   own `check` function; when that basis is unavailable, `from_self`
   is null.)
 - New messages and preceding context are distinguished by `is_context`.
+- The local acknowledged position also records the hashed `message_ref`
+  values at its newest timestamp. When a capped batch divides messages
+  from the same millisecond, only the acknowledged refs are excluded from
+  the next batch. The known `has_more` continuation is checked even when
+  the thread activity timestamp has not advanced. These fields are
+  metadata only and advance through the same receiver-confirmation path.
+- Legacy positions without boundary refs retain their timestamp-only
+  meaning until a newer batch is acknowledged. Previously lost boundary
+  information cannot be reconstructed automatically from old state.
 - A batch holds at most 500 message lines. If more new messages exist,
   the batch takes the oldest slice and sets `has_more`; the rest forms
   the next batch after confirmation. If the fetch window cannot reach
@@ -107,6 +137,10 @@ It seeds the hub with the existing context. Receiving it means only
 that the retained range arrived — it does not mark anything read,
 answered, or reminded, and it never becomes a reason to skip later
 diffs.
+`--initial-context` therefore rejects a thread that already has an
+acknowledged position; use normal diff delivery for that conversation.
+Its `has_more` flag reports unavailable older context, not a request to
+advance over subsequent new messages.
 
 ### Health signal
 
@@ -129,8 +163,11 @@ with explicit truncation reporting. It writes nothing anywhere.
 
 ## Identities and retries
 
-Batch ids derive from (thread, newest included message) and completion
-notices use deterministic submission ids, so a retry after an unknown
+Batch ids include a SHA-256 over the full thread key and the ordered refs
+of the selected messages, alongside the newest timestamp. This distinguishes
+two capped slices ending in the same millisecond and threads whose short
+key prefixes match. Existing pending ids keep their original identities.
+Completion notices use deterministic submission ids, so a retry after an unknown
 outcome re-presents the same identity instead of duplicating the
 handover; the outcome is diagnosed by that id, never resent under a
 new one.
