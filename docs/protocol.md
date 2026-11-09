@@ -10,20 +10,41 @@ the bridge.
   hourly) in a single transaction per run: index rebuild, snapshot
   append, and update log commit together, so a backup never catches a
   half-written state.
-- `deposit_snapshot.py` hashes the *stable* content (status counts,
+- `deposit_snapshot.py` first creates a consistent temporary backup with the
+  SQLite backup API, then hashes that backup's *stable* content (status counts,
   thread index, per-thread stats, contacts, calls, stable meta —
-  capture timestamps and history tables excluded). Only when that hash
-  changes does it deposit:
+  capture timestamps and history tables excluded). The hash includes read
+  positions and permits shallow databases whose deep tables do not yet exist.
+  An unchanged temporary backup is discarded. Only when that hash changes does
+  it deposit:
   - a consistent snapshot made through the SQLite backup API, named
     `messenger-status-bridge-<UTC stamp>.sqlite3`, transferred to a
-    temporary name in the hub's incoming directory, verified by size
-    and SHA-256, then renamed to its final name (mode 0600);
+    unique private temporary file in the hub's incoming directory, verified by
+    size and SHA-256, then atomically published with a hard link that cannot
+    overwrite any existing final name (mode 0600);
   - an atomically replaced pointer manifest,
     `messenger-status-latest.json`, with file name, bytes, SHA-256,
-    backup UTC, schema version, content hash, and previous file.
+    backup UTC, schema version, content hash, and the actual previous file.
+    The manifest is already mode 0600 before publication.
+- Publication uses the remote Python configured by `receiver.python` (default
+  `/usr/bin/python3`), Python 3.9 or later with its standard library only. It
+  requires POSIX advisory locks and hard links within the incoming directory.
+  Local checks and remote publication are serialized. Before transmission,
+  local state atomically records the exact pending manifest alongside the last
+  successful state. The successful-state fields advance only after a matching
+  response or verified diagnosis.
 - Existing versions are never overwritten or deleted by the producer.
-  A failed deposit changes nothing on the receiving side; the latest
-  successful version simply stays in place.
+  Verification and filename-conflict failures preserve the previous latest
+  manifest. A later manifest-install failure can leave a verified but
+  unreferenced version. After an unknown SSH outcome, subsequent runs diagnose
+  only that pending identity using read-only remote access. The current latest
+  manifest must match the pending filename, byte count, SHA-256, backup time,
+  schema version, and content hash, and the regular snapshot file's bytes must
+  verify. A match finishes local state without retransmission. Any missing,
+  different, or unverifiable result retains pending state and exits nonzero
+  with `reconciliation required`; it never generates a fresh timestamp or
+  automatically republishes an orphan. Successful state retains its original
+  `content_hash`, `file`, and `backup_utc` shape.
 
 ## 2. Content batches (JSONL stream)
 

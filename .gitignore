@@ -7,3 +7,4 @@ bridge.local.json
 exports/
 __pycache__/
 *.part
+deposit-state.lock
