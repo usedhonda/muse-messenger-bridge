@@ -37,9 +37,10 @@ ahead of its handed position, `stream_content_batch.py`:
 
 1. Refreshes that one conversation at the source and reads it live.
 2. Builds one UTF-8 JSONL batch **in memory** and pipes it through the
-   SSH connection's stdin to `<name>.part` in the hub's content
-   directory, then renames it to `.jsonl` after a clean close and a
-   byte-count check. The producer writes no body file locally.
+   SSH connection's stdin to a unique private temporary file in the hub's content directory.
+   The configured remote Python verifies byte count and SHA-256, then
+   publishes the `.jsonl` name with an atomic hard link that refuses any
+   existing destination. The producer writes no body file locally.
 3. When a receiver endpoint is configured, calls it over the same SSH
    route after the file is final. Only an exit-0 response whose status
    is `batch_received` for the exact batch id advances the
