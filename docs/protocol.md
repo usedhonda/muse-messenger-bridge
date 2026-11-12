@@ -9,7 +9,12 @@ the bridge.
 - The producer rebuilds the status DB every minute (deep collection
   hourly) in a single transaction per run: index rebuild, snapshot
   append, and update log commit together, so a backup never catches a
-  half-written state.
+  half-written state. A failed source command, malformed collection, or failed
+  deep refresh rolls back the run and preserves the previous status. Failure
+  health is recorded in the selected database with a sanitized error; each
+  source command has a 120-second timeout. Every successful run creates the
+  complete schema; shallow runs leave uncollected deep tables empty so the
+  receiver can query them without inventing message statistics.
 - `deposit_snapshot.py` hashes the *stable* content (status counts,
   thread index, per-thread stats, contacts, calls, stable meta —
   capture timestamps and history tables excluded). Only when that hash
@@ -35,9 +40,10 @@ ahead of its handed position, `stream_content_batch.py`:
    exact batch id, file name, byte count, SHA-256, and coverage metadata
    locally before starting any remote operation. No bodies enter this
    state file. It then pipes the batch through the SSH connection's
-   stdin to `<name>.part` in the hub's content
-   directory, then renames it to `.jsonl` after a clean close and a
-   byte-count check. The producer writes no body file locally.
+   stdin to a unique private temporary file in the hub's content directory.
+   The configured remote Python verifies byte count and SHA-256, then
+   publishes the `.jsonl` name with an atomic hard link that refuses any
+   existing destination. The producer writes no body file locally.
 3. When a receiver endpoint is configured, calls it over the same SSH
    route after the file is final. Only an exit-0 response whose status
    is `batch_received` for the exact batch id advances the
